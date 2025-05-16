@@ -1,0 +1,1771 @@
+# Módulo CrowPanel ESP32 Display de 5,0, 800*480
+# ESP32-S3-WROOM-1-N4R8 
+# TFT-LCD capacitiva con driver IC ILI6122 + ILI5960, rpi_dpi_rgb plaform
+# Touchscreen: gt911, I2C SDA GPIO19, SDA GPIO20
+# GPIO D GPIO38
+# TXD GPIO43
+# RXD GPIO44
+# backlight GPIO2
+
+# JK-PB2A16S15P
+# Balance Activo: BMS para Inversores
+# Corriente de Balance Activo: 2 A
+# Corriente Continua de Descarga/Carga: 150 A (300A máximo 2 minutos)
+# Baterías Compatibles (Cadenas de Celdas):
+#    (Li-ion) 7 a 16 celdas en serie
+#    (LiFePO₄) 8 a 16 celdas en serie
+#    (LTO) 14 celdas en serie
+
+#  RS485-2                     CONVERTER                          UART-TTL
+#┌──────────┐                ┌───────────┐                       ┌─────────┐
+#│          │<----- A  ----->│  SERIAL   │<-----------------Vcc--│         │<--Vcc
+#│  JK-BMS  │<----- B  ----->│  TTL TO   │                       │ ESP32   │
+#│          │                │  RS485    │--TX---------------RX->│         │
+#│          │                │           │<-RX---------------TX--│         │
+#│          │                │ CONVERTER │                       │         │
+#│          │                │  HW-519   │                       │         │
+#│          │                │           │                       │         │
+#|          |<------GND----->|           |<----------GND-------->|         |<--GND
+#└──────────┘                └───────────┘                       └─────────┘      
+#        RJ-45 RS485-2                         RJ-45 RS485-2
+#┌─────────────────────────┐           ┌─────────────────────────┐  
+#│                         │           │                         │  
+#│ O  O  O  O  O  O  O  O  │           │ O  O  O  O  O  O  O  O  │  
+#│ 1  2  3  4  5  6  7  8  │           │ 9  10 11 12 13 14 15 16 │     
+#└─────────────────────────┘           └─────────────────────────┘     
+#  │  │  │        |  |  |                │  │  │        |  │  │    
+#  │  │  └── GND ─┘  |  |                │  │  └── GND ─┘  │  │                          
+#  │  └───── A  ─────┘  |                │  └────  A ──────┘  │                           
+#  └──────── B  ────────┘                └──────── B ─────────┘ 
+
+# https://github.com/syssi/esphome-jk-bms/tree/main
+# https://github.com/txubelaxu/esphome-jk-bms/blob/main/components/jk_rs485_bms/README.md
+
+substitutions:  
+  name: bms-lvgl
+  firmware_version: "0.0.2"                  # 13/4/25 (beta)
+  tx_pin_uart_0: GPIO44                      # Pin GPIO utilizado para la transmisión UART (TX)
+  rx_pin_uart_0: GPIO43                      # Pin GPIO utilizado para la recepción UART (RX)
+  #talk_pin_rs485: GPIO38                    # Pin DE/RE para habilitar el modo transmisión (Driver Enable) del transceptor RS-485
+
+esphome:
+  name: ${name}                              # Nombre del dispositivo en ESPHome
+  comment: "JK-BMS PB RS485 V. ${firmware_version}"
+  friendly_name: bms_lvgl                    # Nombre amigable que aparecerá en Home Assistant
+  project:
+    name: radioelf.bms
+    version: "${firmware_version}"
+  platformio_options:
+    build_flags: "-DBOARD_HAS_PSRAM"         # Habilita el uso de PSRAM en la placa
+    board_build.esp-idf.memory_type: qio_opi # Configuración del tipo de memoria flash
+    board_build.flash_mode: dio              # Modo de flash DIO (Dual Input/Output)
+    # board_upload.maximum_ram_size: 524288  # Tamaño máximo de RAM permitido para la carga
+
+esp32:
+  board: esp32-s3-devkitc-1                  # Placa específica 
+  framework:
+    type: esp-idf                            # Framework seleccionado: ESP-IDF
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: y # Frecuencia de CPU configurada a 240 MHz
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y      # Habilita caché de datos de 64 KB
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y    # Permite que las instrucciones se obtengan desde PSRAM
+      CONFIG_SPIRAM_RODATA: y                # Permite que los datos de solo lectura se almacenen en PSRAM
+
+psram:
+  mode: octal                                # Modo octal para la PSRAM
+  speed: 80MHz                               # Velocidad de la PSRAM configurada a 80 MHz
+
+# Habilitar el registro de logs
+logger:
+  level: ERROR                               #DEBUG #INFO #VERY_VERBOSE #VERBOSE 
+  # tx_buffer_size: 512                      # Aumentar el buffer                
+
+# Habilitar la API para Home Assistant con cifrado
+api:
+  encryption:
+    key: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+ota:
+  - platform: esphome
+    password: "xxxxxxxxxxxxxxxxxxxxxxx" # Contraseña para actualizaciones OTA
+
+wifi:
+  ssid: !secret wifi_ssid3
+  password: !secret wifi_password3
+  manual_ip:
+    static_ip: 192.168.x.xx
+    gateway: 192.168.x.xx
+    subnet: 255.255.255.0
+    dns1: 192.168.x.xx
+
+globals:
+  - id: current_page_id
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Definir la variable para el contador actualización tensión celdas
+  - id: counter_value
+    type: int
+    restore_value: false
+    initial_value: '1'
+  # Definir la variable para el contador de auto apagado pantalla
+  - id: ciclo_contador
+    type: int
+    initial_value: '0'
+
+external_components:
+  - source: github://txubelaxu/esphome-jk-bms@main #github://syssi/esphome-jk-bms@main # Fuente externa para el componente JK-BMS
+
+uart:
+  - id: uart_0               # Identificador único para el UART
+    baud_rate: 115200        # Velocidad en baudios configurada a 115200
+    rx_buffer_size: 500      # Tamaño del buffer RX configurado a 500 bytes
+    tx_pin: ${tx_pin_uart_0} # Pin TX 
+    rx_pin: ${rx_pin_uart_0} # Pin RX 
+
+jk_rs485_sniffer:
+  - id: sniffer0
+    protocol_version: "JK02_32S"
+    rx_timeout: 500ms
+    uart_id: uart_0
+
+# Configuración de los interruptores DIP para una sola batería / dirección 0x01
+#   1    2    4    5
+#  ON   OFF  OFF  OFF (0x01)
+# No utilizar la dirección de dispositivo 0x00.
+# Este es el modo Maestro Modbus, para el ESP32. Se Debe usar una dirección 
+# entre 0x01 y 0x0f para que el BMS funcione como Esclavo Modbus.
+jk_rs485_bms:
+  - id: bms0
+    rs485_address: 0x01
+    jk_rs485_sniffer_id: sniffer0
+    update_interval: 15s
+
+output:
+  - platform: ledc                # Utiliza el controlador LEDC para generar una señal PWM (compatible con ESP32)
+    pin: 2                        # Pin GPIO 2 conectado al control de retro-iluminación del display
+    frequency: 1220               # Frecuencia PWM de 1220 Hz (lo suficientemente alta para evitar parpadeos visibles)
+    id: gpio_backlight_pwm        # Identificador para este canal de salida PWM
+
+light:
+  - platform: monochromatic       # Define una luz de tipo monocromática (una sola intensidad, sin color)
+    output: gpio_backlight_pwm    # Usa la salida PWM definida arriba para controlar esta luz
+    name: Display Backlight       # Nombre que aparecerá en Home Assistant o en logs
+    id: back_light                # Identificador interno para usar en automatizaciones o scripts
+    restore_mode: ALWAYS_ON       # Al encender el dispositivo, esta luz se restaura siempre encendida
+
+display:
+  - platform: rpi_dpi_rgb   # Plataforma para usar una pantalla 
+    id: main_display        # Identificador único para la pantalla
+    color_order: RGB        # Orden de los colores (Rojo, Verde, Azul)
+    invert_colors: True     # Invierte los colores si es necesario
+    update_interval: never  # No se actualiza automáticamente (manual)
+    auto_clear_enabled: false # Desactiva el borrado automático (tarda 2.8 segundos en borrar)
+    dimensions:
+      width: 800            # Ancho de la pantalla en píxeles
+      height: 480           # Alto de la pantalla en píxeles
+    de_pin: 40              # Pin para habilitar datos (DE)
+    hsync_pin: 39           # Pin para sincronización horizontal (HSYNC)
+    vsync_pin: 41           # Pin para sincronización vertical (VSYNC)
+    pclk_pin: 0             # Pin para el reloj de píxel (PCLK)
+    pclk_frequency: 12MHz   # Frecuencia del reloj de píxel (12 MHz)
+    data_pins:
+      red:
+        - 45        # Pin para el bit más bajo del rojo (r1)
+        - 48        # Pin para el segundo bit del rojo (r2)
+        - 47        # Pin para el tercer bit del rojo (r3)
+        - 21        # Pin para el cuarto bit del rojo (r4)
+        - 14        # Pin para el quinto bit del rojo (r5)
+      green:
+        - 5         # Pin para el bit más bajo del verde (g0)
+        - 6         # Pin para el segundo bit del verde (g1)
+        - 7         # Pin para el tercer bit del verde (g2)
+        - 15        # Pin para el cuarto bit del verde (g3)
+        - 16        # Pin para el quinto bit del verde (g4)
+        - 4         # Pin para el sexto bit del verde (g5)
+      blue:
+        - 8         # Pin para el bit más bajo del azul (b1)
+        - 3         # Pin para el segundo bit del azul (b2)
+        - 46        # Pin para el tercer bit del azul (b3)
+        - 9         # Pin para el cuarto bit del azul (b4)
+        - 1         # Pin para el quinto bit del azul (b5)
+
+i2c:
+  - id: bus_a              # Identificador único para el bus I2C
+    sda: GPIO19            # GPIO utilizado como línea SDA
+    scl: GPIO20            # GPIO utilizado como línea SCL
+    frequency: 50kHz       # Frecuencia de comunicación I2C
+
+touchscreen:
+  platform: gt911          # Plataforma de pantalla táctil GT911
+  id: my_touchscreen       # Identificador único para la pantalla táctil
+  display: main_display    # Pantalla asociada a la entrada táctil
+  update_interval: 50ms    # Intervalo de actualización de la entrada táctil
+  address: 0x5D            # Dirección I2C del controlador táctil GT911
+  on_touch:
+    - logger.log:          # Registra un mensaje cuando se detecta un toque
+          format: Touch at (%d, %d)   # Formato del mensaje con las coordenadas X e Y
+          args: [touch.x, touch.y]   # Argumentos que representan las coordenadas X e Y del toque
+    # - lambda: |-            # Código personalizado ejecutado al detectar un toque
+    #      ESP_LOGI("cal", "x=%d, y=%d, x_raw=%d, y_raw=%0d", 
+    #          touch.x,       // Coordenada X calibrada
+    #          touch.y,       // Coordenada Y calibrada
+    #          touch.x_raw,   // Coordenada X sin calibrar
+    #          touch.y_raw    // Coordenada Y sin calibrar
+    #          );
+    - light.turn_on:        # Enciende la retro-iluminación al detectar un toque
+        id: back_light      # Identificador de la retro-iluminación (definido anteriormente)
+        brightness: 100%    # Establece la retro-iluminación al 100%
+    - lambda: id(ciclo_contador) = 0; # Reiniciamos contador
+
+# Definición de un sensor binario para monitorear el estado de una batería
+binary_sensor:
+  # Plataforma utilizada para el sensor, en este caso, jk_bms
+  - platform: jk_rs485_bms
+    jk_rs485_bms_id: bms0
+    status_balancing:
+      name: "Estado balanceo"
+      id: batt_balancing
+    status_precharging:
+      name: "Estado preCarga" 
+      id: batt_precharging
+    status_charging:
+      name: "Estado carga"
+      id: batt_charging
+    status_discharging:
+      name: "Estado descarga"
+      id: batt_discharging
+    status_online:
+      name: "Estado online"
+      id: batt_online
+    status_heating:
+      name: "Estado calefactor"      
+    alarm_wireres: # Resistencia del cable
+      name: "Alarma resistencia cable"
+    alarm_mosotp: # Sobretemp. MOSFET
+      name: "Alarma MosOTP"
+    alarm_cellquantity: # Cantidad de celdas
+      name: "Alarma CellQuantity"
+    alarm_cursensorerr: # Error sensor corriente
+      name: "Alarma CurSensorErr"
+    alarm_cellovp: # Sobretensión celda
+      name: "Alarma CellOVP"
+    alarm_batovp: # Sobretensión batería
+      name: "Alarma BatOVP"
+    alarm_chocp: # Sobrecorriente carga
+      name: "Alarma ChOCP"
+    alarm_chscp: # Cortocircuito carga
+      name: "Alarma ChSCP"
+    alarm_chotp: # Sobretemp. carga
+      name: "Alarma ChOTP"
+    alarm_chutp: # Temp. baja carga
+      name: "Alarma ChUTP"
+    alarm_cpuauxcommuerr: # Error com. CPU aux.
+      name: "Alarma CPUAuxCommuErr"
+    alarm_celluvp: # Subtensión celda
+      name: "Alarma CellUVP"
+    alarm_batuvp: # Subtensión batería
+      name: "Alarma BatUVP"
+    alarm_dchocp: # Sobrecorriente descarga
+      name: "Alarma DchOCP"
+    alarm_dchscp: # Cortocircuito descarga
+      name: "Alarma DchSCP"
+    alarm_dchotp: # Sobretemperatuea. descarga
+      name: "Alarma DchOTP"
+    alarm_chargemos: # MOSFET carga
+      name: "Alarma ChargeMOS"
+    alarm_dischargemos: # MOSFET descarga
+      name: "Alarma DischargeMOS"
+    alarm_gpsdisconneted: # GPS desconectado
+      name: "Alarma GPSDisconneted"
+    alarm_modifypwdintime: # Cambiar clave a tiempo
+      name: "Alarma ModifyPWDinTime"
+    alarm_dischargeonfailed: # Fallo al descargar
+      name: "Alarma DischargeOnFailed"
+    alarm_batteryovertemp: # Sobretemperatura. batería
+      name: "Alarma BatteryOverTemp"
+    alarm_temperaturesensoranomaly: # Falla sensor Temp.
+      name: "Alarma TemperatureSensorAnomaly"
+    alarm_plcmoduleanomaly: # Falla módulo PLC
+      name: "Alarma PLCModuleAnomaly"
+    alarm_mostempsensorabsent: # Falta sensor temp. MOSFET
+      name: "Alarma MOSTempSensorAbsent"
+    alarm_battempsensor1absent: # Falta sensor Temp. 1
+      name: "Alarma BATTempSensor1Absent"
+    alarm_battempsensor2absent: # Falta sensor Temp. 2
+      name: "Alarma BATTempSensor2Absent"
+    alarm_battempsensor3absent: # Falta sensor Temp. 3
+      name: "Alarma BATTempSensor3Absent"
+    alarm_battempsensor4absent: # Falta sensor Temp. 4
+      name: "Alarma BATTempSensor4Absent"
+
+# Definición de un sensor para monitorear varios aspectos de una batería
+sensor:
+  # Plataforma utilizada para el sensor, en este caso, jk_bms
+  - platform: jk_rs485_bms
+    jk_rs485_bms_id: bms0
+    balancing_direction:
+      name: "Dirección balanceo"
+    cell_voltage_min:
+      name: "Voltaje celda min"
+    cell_voltage_max:
+      name: "Voltaje celda max"
+    cell_voltage_min_cell_number:
+      name: "Nº de celda min. voltaje"
+    cell_voltage_max_cell_number:
+      name: "Nº de celda max. voltaje"
+    cell_delta_voltage: # Diferencia de voltaje entre celdas
+      name: "Voltaje delta celdas"
+      id: voltage_delta
+    cell_average_voltage: # Voltaje promedio de las celdas
+      name: "Celda voltage promedio"
+    cell_resistance_min:
+      name: "Resistencia celda min."
+    cell_resistance_max:
+      name: "Resistencia celda max."      
+    cell_resistance_min_cell_number:
+      name: "Nº de celda min. resistencia"
+    cell_resistance_max_cell_number:
+      name: "Nº de celda max. resistencia"      
+    cell_voltage_01:
+      name: "Voltaje celda 01"
+      id: cell_voltage_01
+    cell_voltage_02:
+      name: "Voltaje celda 02"
+      id: cell_voltage_02
+    cell_voltage_03:
+      name: "Voltaje celda 03"
+      id: cell_voltage_03
+    cell_voltage_04:
+      name: "Voltaje celda 04"
+      id: cell_voltage_04
+    cell_voltage_05:
+      name: "Voltaje celda 05"
+      id: cell_voltage_05
+    cell_voltage_06:
+      name: "Voltaje celda 06"
+      id: cell_voltage_06
+    cell_voltage_07:
+      name: "Voltaje celda 07"
+      id: cell_voltage_07
+    cell_voltage_08:
+      name: "Voltaje celda 08"
+      id: cell_voltage_08
+    cell_voltage_09:
+      name: "Voltaje celda 09"
+      id: cell_voltage_09
+    cell_voltage_10:
+      name: "Voltaje celda 10"
+      id: cell_voltage_10
+    cell_voltage_11:
+      name: "Voltaje celda 11"
+      id: cell_voltage_11
+    cell_voltage_12:
+      name: "Voltaje celda 12"
+      id: cell_voltage_12
+    cell_voltage_13:
+      name: "Voltaje celda 13"
+      id: cell_voltage_13
+    cell_voltage_14:
+      name: "Voltaje celda 14"
+      id: cell_voltage_14
+    cell_voltage_15:
+      name: "Voltaje celda 15"
+      id: cell_voltage_15
+    cell_voltage_16:
+      name: "Voltaje celda 16"
+      id: cell_voltage_16
+
+    cell_resistance_01:
+      name: "Resistencia celda 01"
+    cell_resistance_02:
+      name: "Resistencia celda 02"
+    cell_resistance_03:
+      name: "Resistencia celda 03"
+    cell_resistance_04:
+      name: "Resistencia celda 04"
+    cell_resistance_05:
+      name: "Resistencia celda 05"
+    cell_resistance_06:
+      name: "Resistencia celda 06"
+    cell_resistance_07:
+      name: "Resistencia celda 07"
+    cell_resistance_08:
+      name: "Resistencia celda 08"
+    cell_resistance_09:
+      name: "Resistencia celda 09"
+    cell_resistance_10:
+      name: "Resistencia celda 10"
+    cell_resistance_11:
+      name: "Resistencia celda 11"
+    cell_resistance_12:
+      name: "Resistencia celda 12"
+    cell_resistance_13:
+      name: "Resistencia celda 13"
+    cell_resistance_14:
+      name: "Resistencia celda 14"
+    cell_resistance_15:
+      name: "Resistencia celda 15"
+    cell_resistance_16:
+      name: "Resistencia celda 16"
+
+    battery_voltage:
+      name: "Voltaje batería"
+      id: batt_voltage
+    battery_current:
+      name: "Corriente batería"
+      id: batt_corrent
+    battery_power:
+      name: "Potencia batería"
+      id: batt_power
+    battery_power_charging: # Potencia de carga de la batería
+      name: "Potencia carga batería"
+    battery_power_discharging: # Potencia de descarga de la batería
+      name: "Potencia descarga batería"
+    temperature_sensor_1:
+      name: "Temperatura sensor 1"
+      id: batt_temp1
+    temperature_sensor_2:
+      name: "Temperatura sensor 2"
+      id: batt_temp2
+    temperature_sensor_3:
+      name: "Temperatura sensor 3"
+      id: batt_temp3
+    temperature_sensor_4:
+      name: "Temperatura sensor 4"
+      id: batt_temp4
+    temperature_powertube:
+      name: "Temperatura MOSFETS"
+    battery_capacity_state_of_charge:      # Estado de carga (SOC) de la batería
+      name: "SOC de la batería"
+      id: batt_soc
+    battery_capacity_remaining:            # Capacidad restante de la batería
+      name: "Capacidad restante batería"
+      id: batt_capacity
+    charging_cycles:
+      name: "Ciclos de carga"
+    battery_capacity_total_charging_cycle:
+      name: "Ciclo de carga total"
+    battery_total_runtime:
+      name: "total runtime"
+    balancing_current:
+      name: "Corriente balanceo"
+    errors_bitmask:
+      name: "Banderas errores"
+      id: flag_errors
+    cell_count_real:
+      name: "nº celdas real"                                                       
+    smart_sleep_time:
+      name: "Tiempo sueño int."                              
+    powertube_temperature_protection:
+      name: "Prot. temp. tubo pot." 
+    powertube_temperature_protection_recovery:
+      name: "Recup. temp. tubo pot."  
+    battery_total_alarms_count:     
+      name: "Total alarmas"  
+    battery_total_alarms_active:     
+      name: "Alarmas activas"  
+    emergency_time_countdown:
+      name: "Cuenta atrás emergencia"      
+    uart1_protocol_number:
+      name: "nº protocolo UART1"
+    uart2_protocol_number:
+      name: "nº protocolo UART2"  
+    battery_soh_valuation:    
+      name: "valoración SOH bat."
+    discharging_overcurrent_protection_release_time:    
+      name: "Tiempo lib. sobrecorr. desc."
+    discharging_short_circuit_protection_release_time:    
+      name: "Tiempo lib. cortoc. desc."
+    charging_overcurrent_protection_release_time:    
+      name: "Tiempo lib. sobrecorr. carga"
+    charging_short_circuit_protection_release_time:    
+      name: "Tiempo lib. cortoc. carga"
+    cell_undervoltage_protection_release_time:    
+      name: "Tiempo lib. subtensión"
+    cell_overvoltage_protection_release_time:    
+      name: "Tiempo lib. sobretensión"
+
+  - platform: template
+    id: esp_memory
+    icon: mdi:memory
+    name: "Memoria libre"
+    lambda: return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+    unit_of_measurement: 'kB'
+    state_class: measurement
+    entity_category: "diagnostic"
+
+# Configuración de interruptores para controlar y monitorear el estado de carga y descarga de la batería
+switch:
+  # Plataforma utilizada para los interruptores, para jk_bms
+  - platform: template
+    name: "Enviar cambios a todas las BMSs"
+    id: broadcast_active
+    icon: "mdi:cast"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(sniffer0).set_broadcast_changes_to_all_bms(true);  
+    turn_off_action:
+      - lambda: |-
+          id(sniffer0).set_broadcast_changes_to_all_bms(false);          
+
+  - platform: jk_rs485_bms
+    jk_rs485_bms_id: bms0
+    # Estados
+    precharging:
+      name: "Precarga"
+    charging:
+      name: "cargando"
+    discharging:
+      name: "Descargando"
+    balancing:
+      name: "Equilibrando"
+    emergency:
+      name: "Emergencia"
+    heating:
+      name: "Calentador"
+    display_always_on:
+      name: "Pantalla siempre ON"
+    charging_float_mode:
+      name: "Modo de carga flotante"
+    timed_stored_data:
+      name: "Datos almacenados"
+    disable_temperature_sensors:
+      name: "Sensores de temperatura"
+    smart_sleep_on:
+      name: "Reposo activado"
+    disable_pcl_module:
+      name: "Modulo PCL"
+    gps_heartbeat:
+      name: "Latido gps"
+    port_selection:
+      name: "Selección puerto"
+    special_charger:
+      name: "Cargador especial"            
+
+# Configuración de sensores de texto para obtener información textual sobre la batería
+text_sensor:
+  # Plataforma utilizada para los sensores de texto, para jk_bms
+  - platform: jk_rs485_bms
+    jk_rs485_bms_id: bms0
+    errors:
+      name: "Errores"
+      id: bms_errors
+    operation_status:
+      name: "Estado trabajo"
+      id: info_mode
+    # battery_type:
+    #  name: "Tipo de batería"
+    #  id: info_type
+    total_runtime_formatted: # Tiempo total de funcionamiento formateado
+      name: "Tiempo RUN formateado"
+      id: info_time
+    info_vendorid:
+      name: "VendorId"
+      id: info_id
+    info_hardware_version:
+      name: "Hardware"
+    info_software_version:
+      name: "Software"
+      id: info_ver
+    info_device_name:
+      name: "Nombre"
+      id: info_manuf
+    info_device_password:
+      name: "password"  
+      id: info_pass 
+    # network_nodes_available:  # Nodos de red disponibles
+    #   name: "Nodos red"  
+    info_device_serial_number:
+      name: "N. serie"  
+    info_device_setup_passcode:
+      name: "Código config."  
+  
+  - platform: template
+    name: ESP32 RUN
+    id: uptime_human
+    icon: mdi:clock-start
+    internal: true
+
+  # Exponer la versión de ESPHome como sensor.
+  - platform: version
+    name: ${name} ESPHome Version  # Nombre del sensor de versión de ESPHome
+  
+  # Exponer la información de WiFi como sensores.
+  - platform: wifi_info
+    ip_address:
+      name: ${name} IP    # Nombre del sensor de dirección IP
+      id: ip
+    ssid:
+      name: ${name} SSID  # Nombre del sensor de SSID (nombre de la red WiFi)
+      id: ssid
+    bssid:
+      name: ${name} BSSID # Nombre del sensor de BSSID (dirección MAC del punto de acceso)
+
+button:
+  - platform: restart
+    name: "Reiniciar ESP32"
+    id: restart_button
+
+number:
+  - platform: jk_rs485_bms
+    jk_rs485_bms_id: bms0 
+    cell_smart_sleep_voltage:
+      name: "volt. sueño celda"  
+    cell_undervoltage_protection:
+      name: "prot. subtensión celda"
+    cell_undervoltage_protection_recovery:
+      name: "recup. subtensión celda" 
+    cell_overvoltage_protection:
+      name: "prot. sobretensión celda"
+    cell_overvoltage_protection_recovery:
+      name: "recup. sobretensión celda"
+    cell_balancing_trigger_voltage:
+      name: "volt. inicio balanceo" 
+    cell_soc100_voltage:
+      name: "volt. SoC 100%" 
+    cell_soc0_voltage:
+      name: "volt. SoC 0%"    
+    cell_request_charge_voltage:
+      name: "volt. carga solicitada"          
+    cell_request_float_voltage:
+      name: "volt. flotación solicitada"   
+    cell_power_off_voltage:
+      name: "volt. apagado celda"  
+    cell_balancing_starting_voltage:
+      name: "volt. inicio balanceo"        
+    max_charging_current:
+      name: "corr. máx. carga"          
+    charging_overcurrent_protection_delay:
+      name: "ret. prot. sobrecorr. carga"
+    charging_overcurrent_protection_recovery_delay:
+      name: "ret. recup. sobrecorr. carga"
+    max_discharging_current:
+      name: "corr. máx. descarga"     
+    discharging_overcurrent_protection_delay:
+      name: "ret. prot. sobrecorr. descarga"
+    discharging_overcurrent_protection_recovery_delay:
+      name: "ret. recup. sobrecorr. descarga"
+    short_circuit_protection_delay:
+      name: "ret. prot. cortocirc."        
+    short_circuit_protection_recovery_delay:
+      name: "ret. recup. cortocirc." 
+    max_balancing_current:
+      name: "corr. máx. balanceo" 
+    charging_overtemperature_protection:
+      name: "prot. sobretemp. carga"
+    charging_overtemperature_protection_recovery:
+      name: "recup. sobretemp. carga"
+    discharging_overtemperature_protection:
+      name: "prot. sobretemp. descarga"
+    discharging_overtemperature_protection_recovery:
+      name: "recup. sobretemp. descarga" 
+    charging_lowtemperature_protection:
+      name: "prot. temp. baja carga"
+    charging_lowtemperature_protection_recovery:
+      name: "recup. temp. baja carga"
+    mos_overtemperature_protection:
+      name: "prot. sobretemp. MOS"
+    mos_overtemperature_protection_recovery:
+      name: "recup. sobretemp. MOS"   
+    cell_count_settings:
+      name: "nº celdas"      
+    battery_capacity_total_settings:
+      name: "capacidad batería"            
+    precharging_time_from_discharge:
+      name: "tiempo precarga" 
+    cell_request_charge_voltage_time:
+      name: "tiempo volt. carga" 
+    cell_request_float_voltage_time:
+      name: "tiempo volt. flotación" 
+
+# Definición de una imagen
+image:
+  # Primera imagen: icono de batería baja
+  - file: "images/battery_low.png"         # Ruta al archivo de imagen
+    id: celda_baja                         # Identificador único para esta imagen
+    type: RGB565                           # Tipo de formato de imagen
+    resize:  50x220                        # Tamaño al que se re-dimensionará la imagen (ancho x alto)
+    transparency: alpha_channel            # Tipo de transparencia utilizada (canal alfa)
+  # Segunda imagen: icono de batería a media carga
+  - file: "images/battery_half.png"        # Ruta al archivo de imagen
+    id: celda_media                        # Identificador único para esta imagen
+    type: RGB565                           # Tipo de formato de imagen
+    resize:  50x220                        # Tamaño al que se re-dimensionará la imagen (ancho x alto)
+    transparency: alpha_channel            # Tipo de transparencia utilizada (canal alfa)
+  # Tercera imagen: icono de batería con carga óptima
+  - file: "images/battery_ok.png"          # Ruta al archivo de imagen
+    id: celda_ok                           # Identificador único para esta imagen
+    type: RGB565                           # Tipo de formato de imagen
+    resize:  50x220                        # Tamaño al que se re-dimensionará la imagen (ancho x alto)
+    transparency: alpha_channel            # Tipo de transparencia utilizada (canal alfa)
+  # Cuarta imagen: icono de batería sobrecargada
+  - file: "images/battery_overload.png"    # Ruta al archivo de imagen
+    id: celda_alta                         # Identificador único para esta imagen
+    type: RGB565                           # Tipo de formato de imagen
+    resize:  50x220                        # Tamaño al que se re-dimensionará la imagen (ancho x alto)
+    transparency: alpha_channel            # Tipo de transparencia utilizada (canal alfa)
+    # Quinta imagen: icono de batería transparente
+  - file: "images/battery.png"             # Ruta al archivo de imagen
+    id: celda                              # Identificador único para esta imagen
+    type: RGB565                           # Tipo de formato de imagen
+    resize:  50x220                        # Tamaño al que se re-dimensionará la imagen (ancho x alto)
+    transparency: alpha_channel            # Tipo de transparencia utilizada (canal alfa)
+
+# Configuración de la biblioteca gráfica LVGL (Light and Versatile Graphics Library)
+lvgl:
+  # Pantalla principal que se utilizará
+  displays: main_display  # Define la pantalla principal como "main_display"
+  # Definición de las páginas de la interfaz gráfica
+  pages:
+    # Página 0 principal
+    - id: main_page  # Identificador único para la página principal 
+      bg_color:  0xC0C0C0  # Color gris claro 
+      widgets:
+        # Widget de etiqueta para mostrar texto
+        - label:
+            align: TOP_MID           # Alineación del texto en el centro de la pantalla
+            y: 20
+            text: "Estado BATERIA"   # Texto que se mostrará en la etiqueta (acentuado correctamente)
+            text_font: montserrat_36 #lv_font_montserrat_28  # Fuente legible para una pantalla 800x480 (puedes ajustar)
+        - label:
+            id: label_current
+            align: LEFT_MID
+            x: 5                     # hacia la derecha
+            y: -10                   # hacia abajo
+            text: 'A'
+            text_font: montserrat_36
+        - label:
+            id: label_voltage
+            align: LEFT_MID
+            x: 5
+            y: 60
+            text: 'V'
+            text_font: montserrat_36
+        - label:   
+            id: label_soc
+            align: RIGHT_MID
+            x: -20
+            y: 60          
+            text: '%'
+            text_font: montserrat_36
+        - label:
+            id: label_temp
+            align: RIGHT_MID
+            x: -20
+            y: -5
+            text: '°C'
+            text_font: montserrat_36
+        - label:
+            id: label_delta
+            align: RIGHT_MID
+            x: -20
+            y: 115
+            text: 'DV'
+            text_font: montserrat_36
+        - label:
+            id: label_power
+            align: LEFT_MID
+            x: 5
+            y: 125
+            text: 'W'
+            text_font: montserrat_36
+        - label:
+            align: LEFT_MID
+            x: 120
+            y: -160
+            text: "Carga"
+            text_font: montserrat_24
+        - label:
+            align: LEFT_MID
+            x: 240
+            y: -160
+            text: "Descarga"
+            text_font: montserrat_24
+        - label:
+            align: LEFT_MID
+            x: 410
+            y: -160
+            text: "Balanceo"
+            text_font: montserrat_24
+        - label:
+            align: LEFT_MID
+            x: 560
+            y: -160
+            text: "PreCarga"
+            text_font: montserrat_24
+        - label:
+            align: TOP_RIGHT
+            x: -30
+            y: 50
+            text: "OnLine"
+            text_font: montserrat_24
+        - label:
+            align: TOP_LEFT
+            x: 20
+            y: 50
+            text: "ERROR"
+            text_font: montserrat_24
+        - led:
+            id: led_error
+            align: TOP_LEFT
+            x: 45
+            y: 10
+            color: 0xFF0000  
+        - led:
+            id: led_charging
+            align: LEFT_MID
+            x: 140
+            y: -125
+            color: 0x9999CC
+        - led:
+            id: led_discharging
+            align: LEFT_MID
+            x: 280
+            y: -125
+            color: 0x9999CC
+        - led:
+            id: led_balancing
+            align: LEFT_MID
+            x: 450
+            y: -125
+            color: 0x9999CC
+        - led:
+            id: led_PreCarga
+            align: LEFT_MID
+            x: 600
+            y: -125
+            color: 0x9999CC
+        - led:
+            id: led_connect
+            align: TOP_RIGHT
+            x: -60
+            y: 10
+            color: 0x00F7EF
+        # Gráfica circular de la capacidad de la batería
+        - obj:
+            align: CENTER
+            y: 60
+            width: 400
+            height: 300
+            bg_color: 0xC0C0C0 
+            border_width: 0
+            pad_all: 4
+            widgets:
+              - meter:
+                  height: 100%
+                  width: 100%
+                  border_width: 0
+                  bg_opa: TRANSP
+                  align: CENTER
+                  scales:
+                    - range_from: 0
+                      range_to: 150
+                      angle_range: 180
+                      rotation: 180
+                      ticks:
+                        count: 0
+                      indicators:
+                        - line:
+                            id: val_needle
+                            width: 6
+                            r_mod: 15
+                            value: !lambda 'return int(id(batt_capacity).state);'
+                            color: 0xFFFFFF
+                        - arc:
+                            color: 0xFF0000
+                            r_mod: 8
+                            width: 30
+                            start_value: 0
+                            end_value: 30
+                        - arc:
+                            color: 0x0000FF
+                            r_mod: 8
+                            width: 30
+                            start_value: 30
+                            end_value: 100
+                        - arc:
+                            color: 0x00FF00
+                            r_mod: 8
+                            width: 30
+                            start_value: 100
+                            end_value: 150
+        - label:
+            id: label_capacity
+            align: CENTER
+            x: -20
+            y: 145
+            text: "Ah"
+            text_font: montserrat_36
+      
+#------------------------------------------------------
+    # Página 1 tensión celdas
+    - id: cell_page
+      bg_color: 0xC0C0C0  # Color gris claro 
+      widgets:
+        - label:
+            align: TOP_MID
+            text: "Celdas baterias"
+            text_font: montserrat_28 
+        # Imagen para celda 1
+        - image:
+            id: img_cell_1  # Identificador único para este componente de imagen
+            src: celda     # Devolver una imagen vacía o transparente
+            x: 1            # Posición en el eje X: 5 píxeles desde el borde izquierdo hacia la derecha
+            y: 240          # Posición en el eje Y: 200 píxeles desde el borde superior hacia abajo
+        # Definición de un componente de etiqueta (label)
+        - label: 
+            id: v_cell_1
+            x: 5            # Posición en el eje X: 20 píxeles desde el borde izquierdo hacia la derecha
+            y: 190          # Posición en el eje Y: 175 píxeles desde el borde superior hacia abajo
+            # Texto de la etiqueta
+            text: "V"
+            text_font: montserrat_18      # Fuente del texto:
+         # Imagen para celda 2
+        - image:
+            id: img_cell_2
+            src: celda
+            x: 51
+            y: 240
+        - label:
+            id: v_cell_2            
+            x: 58
+            y: 220
+            text: "V"
+            text_font: montserrat_18
+        # Imagen para celda 3 baja 
+        - image:
+            id: img_cell_3
+            src: celda
+            x: 101
+            y: 240
+        - label:
+            id: v_cell_3
+            x: 108
+            y: 190
+            text: "V"
+            text_font: montserrat_18 
+        # Imagen para celda 4
+        - image:
+            id: img_cell_4
+            src: celda
+            x: 151
+            y: 240
+        - label:
+            id: v_cell_4
+            x: 158
+            y: 220
+            text: "V"
+            text_font: montserrat_18 
+        # Imagen para celda 5  
+        - image:
+            id: img_cell_5
+            src: celda
+            x: 201
+            y: 240
+        - label:
+            id: v_cell_5
+            x: 208
+            y: 190
+            text: "V"
+            text_font: montserrat_18 
+         # Imagen para celda 6
+        - image:
+            id: img_cell_6
+            src: celda
+            x: 251
+            y: 240
+        - label:
+            id: v_cell_6
+            x: 258
+            y: 220
+            text: "V"
+            text_font: montserrat_18 
+        # Imagen para celda 7  
+        - image:
+            id: img_cell_7
+            src: celda
+            x: 301
+            y: 240
+        - label:
+            id: v_cell_7
+            x: 308
+            y: 190
+            text: "V"
+            text_font: montserrat_18 
+         # Imagen para celda 8
+        - image:
+            id: img_cell_8
+            src: celda
+            x: 351
+            y: 240
+        - label:
+            id: v_cell_8
+            x: 358
+            y: 220
+            text: "V"
+            text_font: montserrat_18 
+        # Imagen para celda 9 
+        - image:
+            id: img_cell_9
+            src: celda
+            x: 401
+            y: 240
+        - label:
+            id: v_cell_9
+            x: 408
+            y: 190
+            text: "V"
+            text_font: montserrat_18 
+         # Imagen para celda 10
+        - image:
+            id: img_cell_10
+            src: celda
+            x: 451
+            y: 240
+        - label:
+            id: v_cell_10
+            x: 458
+            y: 220
+            text: "V"
+            text_font: montserrat_18 
+        # Imagen para celda 11
+        - image:
+            id: img_cell_11
+            src: celda
+            x: 501
+            y: 240
+        - label:
+            id: v_cell_11
+            x: 508
+            y: 190
+            text: "V"
+            text_font: montserrat_18 
+        # Imagen para celda 12 
+        - image:
+            id: img_cell_12
+            src: celda
+            x: 551
+            y: 240
+        - label:
+            id: v_cell_12
+            x: 558
+            y: 220
+            text: "V"
+            text_font: montserrat_18 
+        # Imagen para celda 13
+        - image:
+            id: img_cell_13
+            src: celda
+            x: 601
+            y: 240
+        - label:
+            id: v_cell_13
+            x: 608
+            y: 190
+            text: "V"
+            text_font: montserrat_18 
+         # Imagen para celda 14
+        - image:
+            id: img_cell_14
+            src: celda
+            x: 651
+            y: 240
+        - label:
+            id: v_cell_14
+            x: 658
+            y: 220
+            text: "V"
+            text_font: montserrat_18 
+        # Imagen para celda 15
+        - image:
+            id: img_cell_15
+            src: celda
+            x: 701
+            y: 240
+        - label:
+            id: v_cell_15
+            x: 708
+            y: 190
+            text: "V"
+            text_font: montserrat_18 
+         # Imagen para celda 16 
+        - image:
+            id: img_cell_16
+            src: celda
+            x: 751
+            y: 240
+        - label:
+            id: v_cell_16
+            x: 750
+            y: 220
+            text: "V"
+            text_font: montserrat_18 
+
+        - label:
+            x: 25
+            y: 395
+            text: "1      2      3      4      5      6      7       8      9     10     11     12     13     14     15     16"
+            text_font: montserrat_22 
+            text_color: 0xFF0000
+ #------------------------------------------------------   
+    # Página 2
+    - id: info_page
+      bg_color: 0xC0C0C0  # Color gris claro 
+      widgets:
+        - label:
+            align: TOP_MID
+            text: "Informacion"
+            text_font: montserrat_28 
+        - label:
+            id: label_error
+            x: 40
+            y: 20
+            text: "Error: "
+            text_font: montserrat_20
+        - label:
+            id: label_mode
+            x: 40
+            y: 50
+            text: "Modo: "
+            text_font: montserrat_20
+        - label:
+            id: label_memory
+            x: 40
+            y: 80
+            text: "Memoria: "
+            text_font: montserrat_20
+        - label:
+            id: label_ip
+            x: 40
+            y: 110
+            text: "IP: "
+            text_font: montserrat_20
+        - label:
+            id: label_ssid
+            x: 40
+            y: 140
+            text: "SSID: "
+            text_font: montserrat_20
+        - label:
+            id: label_id
+            x: 40
+            y: 170
+            text: "Identificador: "
+            text_font: montserrat_20
+        - label:
+            id: label_soft
+            x: 40
+            y: 200
+            text: "Software: "
+            text_font: montserrat_20
+        - label:
+            id: label_name
+            x: 40
+            y: 230
+            text: "Nombre: "
+            text_font: montserrat_20
+        - label:
+            id: label_firmware
+            x: 40
+            y: 260
+            text: "Firmware v. "
+            text_font: montserrat_20
+        - label:
+            id: label_run
+            x: 40
+            y: 290
+            text: "Periodo: "
+            text_font: montserrat_20
+        - label:
+            id: label_online
+            x: 40
+            y: 320
+            text: "BMS: "
+            text_font: montserrat_20
+
+  # Capa superior que se superpone a todas las páginas (ideal para menús, botones fijos, etc.)
+  top_layer:
+    widgets:
+      # Matriz de botones para la navegación entre páginas
+      - buttonmatrix:
+          id: top_layer               # Identificador único para esta matriz de botones
+          align: bottom_mid           # Alineación en la parte inferior central de la pantalla
+          width: 800                  # Ancho total de la pantalla
+          height: 60                  # Altura razonable para botones grandes
+          pad_all: 0                  # Sin espacio adicional alrededor de los botones
+          outline_width: 0            # Sin borde en los botones
+          bg_color: 0xC0C0C0          # Color gris claro 
+          items:
+            pressed:
+              bg_color: 0xFF0000      # Rojo
+          text_color: 0x0000          # Texto negro
+          radius: 10                  # Bordes rectos (sin redondeo)
+
+          # Fila de botones
+          rows:
+            - buttons:
+              # Botón para ir a la página anterior
+              - id: page_prev
+                text: "\uF053"        # Icono de flecha izquierda (Font Awesome)
+                on_press:
+                  then:
+                    - lvgl.page.previous:  # Ir a la página anterior
+                    - lambda: |-         
+                        if (id(current_page_id) == 0) {
+                          id(current_page_id) = 2;
+                        } else if (id(current_page_id) == 1) {
+                          id(current_page_id) = 0;
+                        } else if (id(current_page_id) == 2) {
+                          id(current_page_id) = 1;
+                        }
+                    
+              # Botón para ir a la página principal
+              - id: page_home
+                text: "\uF015"        # Icono de casa
+                on_press:
+                  then:
+                    - lvgl.page.show: main_page  # Mostrar la página principal
+                    - lambda: id(current_page_id) = 0;
+
+              # Botón para ir a la página siguiente
+              - id: page_next
+                text: "\uF054"        # Icono de flecha derecha
+                on_press:
+                  then:
+                    - lvgl.page.next:   # Ir a la siguiente página
+                    - lambda: |-         
+                        if (id(current_page_id) == 0) {
+                          id(current_page_id) = 1;
+                        } else if (id(current_page_id) == 1) {
+                          id(current_page_id) = 2;
+                        } else if (id(current_page_id) == 2) {
+                          id(current_page_id) = 0;
+                        }
+                    
+interval:
+  - interval: 200ms                     # Ejecuta el bloque'then' cada 200 milisegundos
+    then:
+      - if:                             # Condición: solo ejecuta lo siguiente si se cumple
+          condition:
+            - light.is_on: back_light    # Verifica si la luz 'back_light' (retro-iluminación) está encendida
+            - binary_sensor.is_on: batt_online # Verifica que estemos conectados a la BMS
+          then:
+            - script.execute: actualizar_pantalla_bms  # Ejecuta el script de actualización de pantalla
+            - lambda: |-
+                id(ciclo_contador) += 1;          // Incrementa el contador de ciclos
+      - if:                             # Condición adicional: Si la luz no está encendida
+          condition:
+            light.is_off: back_light    # Verifica si la luz 'back_light' está apagada
+          then:
+            - lambda: id(ciclo_contador) = 0;  // Si la luz está apagada, reinicia el contador
+      - if:     
+          condition:
+            lambda: return id(ciclo_contador) >= 300;
+          then:
+            - lambda: id(ciclo_contador) = 0;  
+            - light.turn_on:       
+                id: back_light      
+                brightness: 0%    
+      - if:
+          condition:
+            binary_sensor.is_off: batt_online
+          then:
+            # Si no está conectado
+            - lvgl.led.update:
+                id: led_connect
+                color: 0x9999CC  # Color gris
+
+#************************************************************************************************************************
+script:
+  - id: actualizar_pantalla_bms
+    mode: queued #  Asegura que las acciones se ejecuten en orden, sin superponerse, útil para actualizaciones LVGL rápidas
+    then:
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) != 1;'
+          then:
+            - lambda: 'id(counter_value) = 0;'
+
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 1;'
+          then:
+            - lambda: |-
+                id(counter_value)++;
+                if (id(counter_value) > 16) {
+                  id(counter_value) = 1;
+                }
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 1;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_1
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_01).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_1
+                src: !lambda |-
+                  float v = id(cell_voltage_01).state;             // Obtener el valor actual de la celda 1 y almacenarlo en 'v'
+                  if (std::isnan(v) || (v < 1.50)) return id(celda); // Si el valor no es un número (por error o sin inicializar), devolver ícono por defecto
+                  if (v < 3.15) return id(celda_baja);             // Si la tensión es menor a 3.15 V, se considera baja (casi descargada)
+                  if (v < 3.35) return id(celda_media);            // Si la tensión está entre 3.15 V y 3.35 V, es media (zona útil de descarga)
+                  if (v >= 3.45) return id(celda_alta);            // Si la tensión es igual o superior a 3.45 V, está muy cargada (zona alta)
+                  return id(celda_ok);                             // Para tensiones entre 3.35 V y 3.45 V, se considera una carga adecuada/óptima
+
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 2;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_2 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_02).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_2
+                src: !lambda |-
+                  float v = id(cell_voltage_02).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);           
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);         
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 3;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_3 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_03).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_3
+                src: !lambda |-
+                  float v = id(cell_voltage_03).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);         
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);
+                  if (v >= 3.45) return id(celda_alta);
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 4;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_4 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_04).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_4
+                src: !lambda |-
+                  float v = id(cell_voltage_04).state;                
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);              
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 5;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_5 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_05).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_5
+                src: !lambda |-
+                  float v = id(cell_voltage_05).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);              
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 6;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_6 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_06).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_6
+                src: !lambda |-
+                  float v = id(cell_voltage_06).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);            
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 7;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_7 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_07).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_7
+                src: !lambda |-
+                  float v = id(cell_voltage_07).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);          
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 8;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_8 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_08).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_8
+                src: !lambda |-
+                  float v = id(cell_voltage_08).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);        
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);           
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 9;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_9 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_09).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_9
+                src: !lambda |-
+                  float v = id(cell_voltage_09).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);      
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 10;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_10 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_10).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_10
+                src: !lambda |-
+                  float v = id(cell_voltage_10).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);          
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);           
+                  if (v >= 3.45) return id(celda_alta);           
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 11;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_11 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_11).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_11
+                src: !lambda |-
+                  float v = id(cell_voltage_11).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);            
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 12;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_12 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_12).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_12
+                src: !lambda |-
+                  float v = id(cell_voltage_12).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);             
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 13;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_13 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_13).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_13
+                src: !lambda |-
+                  float v = id(cell_voltage_13).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);             
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 14;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_14
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_14).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_14
+                src: !lambda |-
+                  float v = id(cell_voltage_14).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);             
+                  if (v < 3.15) return id(celda_baja);            
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 15;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_15
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_15).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_15
+                src: !lambda |-
+                  float v = id(cell_voltage_15).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);          
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      - if:
+          condition:
+            lambda: 'return id(counter_value) == 16;'
+          then:
+            - lvgl.label.update:
+                id: v_cell_16 
+                text: !lambda 'return esphome::value_accuracy_to_string(id(cell_voltage_16).state, 2) + "V";'
+            - lvgl.image.update:
+                id: img_cell_16
+                src: !lambda |-
+                  float v = id(cell_voltage_16).state;                   
+                  if (std::isnan(v) || (v < 1.50)) return id(celda);             
+                  if (v < 3.15) return id(celda_baja);             
+                  if (v < 3.35) return id(celda_media);            
+                  if (v >= 3.45) return id(celda_alta);            
+                  return id(celda_ok);
+      # Condiciones para la página 0:
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 0;'
+          then:
+            - lvgl.label.update:
+                id: label_current
+                text: !lambda 'return esphome::value_accuracy_to_string(id(batt_corrent).state, 2) + "A";'
+            - lvgl.label.update:
+                id: label_voltage
+                text: !lambda 'return esphome::value_accuracy_to_string(id(batt_voltage).state, 2) + "V";'
+            - lvgl.label.update:
+                id: label_power
+                text: !lambda 'return esphome::value_accuracy_to_string(id(batt_power).state, 2) + "W";'
+            - lvgl.label.update:
+                id: label_temp
+                text: !lambda |-
+                        float avg = (
+                          id(batt_temp1).state +
+                          id(batt_temp2).state +
+                          id(batt_temp3).state +
+                          id(batt_temp4).state) / 4.0;
+                          char buffer[16];
+                          snprintf(buffer, sizeof(buffer), "%.1f°C", avg);
+                          return std::string(buffer);
+            - lvgl.label.update:
+                id: label_soc
+                text: !lambda 'return esphome::value_accuracy_to_string(id(batt_soc).state, 2) + "%";'
+            - lvgl.label.update:    
+                id: label_delta
+                text: !lambda 'return esphome::value_accuracy_to_string(id(voltage_delta).state, 2) + "\uF071V";' # tensión delta de las celdas ΔV
+                text_color: !lambda |-
+                    float delta = id(voltage_delta).state;
+                    delta = abs(delta);
+                    if (delta > 0.5) {
+                      return lv_color_hex(0xFF0000); // Rojo para diferencias grandes (>0.5V)
+                    } else if (delta > 0.2) {
+                      return lv_color_hex(0xFFA500); // Naranja para diferencias medias (>0.2V)
+                    } else if (delta > 0.02) {
+                      return lv_color_hex(0x0000FF); // Azul para valores pequeñas diferencias (>0.02V)
+                    } else {
+                      return lv_color_hex(0x00FF00); // Verde para valores diferencias mínimas (0-0.02V)
+                    }
+            - lvgl.label.update:
+                id: label_capacity
+                text: !lambda 'return esphome::value_accuracy_to_string(id(batt_capacity).state, 2) + "Ah";'
+      - if:
+          condition:
+            lambda: 'return id(batt_charging).state;'
+          then:
+            - lvgl.led.update:
+                id: led_charging
+                color: 0x00FF80
+          else:
+            - lvgl.led.update:
+                id: led_charging
+                color: 0x9999CC
+      - if:
+          condition:
+            lambda: 'return id(batt_discharging).state;'
+          then:
+            - lvgl.led.update:
+                id: led_discharging
+                color: 0x00FF80
+          else:
+            - lvgl.led.update:
+                id: led_discharging
+                color: 0x9999CC 
+      - if:
+          condition:
+            lambda: 'return id(batt_precharging).state;'
+          then:
+            - lvgl.led.update:
+                id: led_PreCarga
+                color: 0x00FF80
+          else:
+            - lvgl.led.update:
+                id: led_PreCarga
+                color: 0x9999CC 
+      - if:
+          condition:
+            lambda: 'return id(batt_balancing).state;'
+          then:
+            - lvgl.led.update:
+                id: led_balancing
+                color: 0x00FF80
+          else:
+            - lvgl.led.update:
+                id: led_balancing
+                color: 0x9999CC 
+      - if:
+          condition:
+            lambda: 'return id(batt_online).state;'
+          then:
+            - lvgl.led.update:
+                id: led_connect
+                color: 0x00FF00
+          else:
+            - lvgl.led.update:
+                id: led_connect
+                color: 0x9999CC 
+      - if:
+          condition:
+            lambda: 'return !id(flag_errors).state;'
+          then:
+            - lvgl.led.update:
+                id: led_error
+                color: 0x00FF00
+          else:
+            - lvgl.led.update:
+                id: led_error
+                color: 0xFF0000 
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 0;'
+          then:
+            - lvgl.indicator.update:
+                id: val_needle
+                value: !lambda 'return id(batt_soc).state;'
+       # Página información
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_error
+                text: !lambda 'return ("ERROR: " + id(bms_errors).state);' 
+                text_color: !lambda |-
+                    if (id(flag_errors).state) {
+                      return lv_color_hex(0xFF0000); 
+                    } else {
+                      return lv_color_hex(0x00FF00);
+                    }
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_mode
+                text: !lambda 'return "Modo: " + (id(info_mode).state);'
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_memory
+                text: !lambda 'char buffer[32]; snprintf(buffer, sizeof(buffer), "Memoria: %.1f", id(esp_memory).state); return std::string(buffer);'
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_ip
+                text: !lambda 'return "IP: " + (id(ip).state);'
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_ssid
+                text: !lambda 'return "SSID: " + (id(ssid).state);'
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_id
+                text: !lambda 'return "Identificador: " + (id(info_id).state);'
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_soft
+                text: !lambda 'return "Software: " + (id(info_ver).state);'
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_firmware
+                text: "Firmware v. ${firmware_version}"
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_run
+                text: !lambda 'return ("Periodo: " + id(info_time).state);' 
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_name
+                text: !lambda 'return "Nombre: " + (id(info_manuf).state);'
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_run
+                text: !lambda 'return ("Periodo: " + id(info_time).state);'
+      - if:
+          condition:
+            lambda: 'return id(current_page_id) == 2;'
+          then:
+            - lvgl.label.update:
+                id: label_online
+                text: !lambda |-
+                          return std::string("BMS: ") + (id(batt_online).state ? "ONLINE" : "OFFLINE");
+
+
+
